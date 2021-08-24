@@ -2,15 +2,18 @@ import os
 import sys
 import json
 import asyncio
+import ssl
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from splunklib.modularinput import *
 import aiohttp
+import certifi
 
 class Input(Script):
     MASK = "<encrypted>"
     APP = __file__.split(os.sep)[-3]
     USER_AGENT = "Splunk TA_crowdstrike_eventstream_alternative"
+    ACCESS_TOKEN = None
 
     def get_scheme(self):
 
@@ -50,9 +53,11 @@ class Input(Script):
         kind, name = input_name.split("://")
         auth_url = f"https://{input_items['domain']}/oauth2/token"
         discover_url = f"https://{input_items['domain']}/sensors/entities/datafeed/v2"
-        app_id = f"Splunk {input_name}"
+        app_id = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
         checkpoint_folder = self._input_definition.metadata["checkpoint_dir"]
-        access_token = None
+        auth = {"access_token":None,"client_id":None,"client_secret":None}
+
+        sslcontext = ssl.create_default_context(cafile=os.path.join(os.path.dirname(__file__),'cacert.pem'))
 
         # Password Encryption / Decryption
         updates = {}
@@ -62,7 +67,7 @@ class Input(Script):
                 if len(stored_password) != 1:
                     ew.log(EventWriter.ERROR,f"Encrypted {item} was not found for {input_name}, reconfigure its value.")
                     return
-                input_items[item] = stored_password[0].content.clear_password
+                auth[item] = stored_password[0].content.clear_password
             else:
                 if(stored_password):
                     ew.log(EventWriter.DEBUG,"Removing Current password")
@@ -70,25 +75,28 @@ class Input(Script):
                 ew.log(EventWriter.DEBUG,"Storing password and updating Input")
                 self.service.storage_passwords.create(input_items[item],item,name)
                 updates[item] = self.MASK
+                auth[item] = input_items[item]
         if(updates):
             self.service.inputs.__getitem__((name,kind)).update(**updates)
         
         
         # Setup Async
         async def main():
+            ew.log(EventWriter.INFO,f"Starting Event Stream '{app_id}'")
             session = aiohttp.ClientSession()
             # Login
             async def login(wait=0):
                 await asyncio.sleep(wait)
-                async with session.post(auth_url, data={'client_id':input_items['client_id'],'client_secret':input_items['client_secret']},headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}) as r:
-                    r.raise_for_status()
+                async with session.post(auth_url, data={'client_id':auth['client_id'],'client_secret':auth['client_secret']},headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                     login_data = await r.json()
-                    access_token = login_data['access_token']
-                    ew.log(EventWriter.INFO,"Access token refreshed")
-                    loop.create_task(login(login_data['expires_in']-10))
-            
+                    r.raise_for_status()
+                    auth['access_token'] = login_data.get('access_token')
+                ew.log(EventWriter.INFO,f"Access token refreshed")
+                loop.create_task(login(login_data['expires_in']-10))
+
             await login()
-            if not access_token:
+
+            if auth['access_token'] == None:
                 ew.log(EventWriter.ERROR,"No Access token, cannot proceed")
                 await session.close()
                 loop.stop()
@@ -101,12 +109,19 @@ class Input(Script):
                 return
 
             # Discover
-            async with session.get(discover_url, params={'appId':app_id,'format':'json'},headers={'Authorization': f"Bearer {self['access_token']}", 'User-Agent': self.USER_AGENT}) as r:
+            async with session.get(discover_url, params={'appId':app_id,'format':'json'}, headers={'Authorization': f"Bearer {auth['access_token']}", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                 r.raise_for_status()
                 discovery_data = await r.json()
+                ew.log(EventWriter.DEBUG,discovery_data)
+                if discovery_data['resources'] == None:
+                    ew.log(EventWriter.ERROR,"No Event Stream feeds discovered")
+                    await session.close()
+                    loop.stop()
+                    return
                 count = len(discovery_data['resources'])
-                ew.log(EventWriter.INFO,f"Discovered {count} feeds")
+                ew.log(EventWriter.INFO,f"Discovered {count} Event Stream feed(s)")
 
+            # Listen
             async def listen(number,feed):
                 # Schedule Feed Refresh
                 refresh_url = feed['refreshActiveSessionURL']
@@ -114,7 +129,7 @@ class Input(Script):
                 async def refresh():
                     while True:
                         await asyncio.sleep(refresh_time)
-                        async with session.post(refresh_url,headers={'Authorization': f"Bearer {self['access_token']}", 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}) as refresh:
+                        async with session.post(refresh_url,headers={'Authorization': f"Bearer {auth['access_token']}", 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as refresh:
                             r.raise_for_status()
                             ew.log(EventWriter.INFO,"Refreshed feed {number}")
 
@@ -140,7 +155,7 @@ class Input(Script):
                     offset = 0
                 
                 while True:
-                    async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}) as r:
+                    async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                         r.raise_for_status()
                         while True:
                             raw = await r.content.readline()
@@ -149,7 +164,7 @@ class Input(Script):
                             try:
                                 data = json.loads(raw.decode('utf-8'))
                             except:
-                                ew.log(EventWriter.ERROR,"Failed to parse event: {raw}")
+                                ew.log(EventWriter.WARN,"Failed to parse event: {raw}")
                                 continue
 
                             offset = data['metadata']['offset']
@@ -173,6 +188,7 @@ class Input(Script):
         loop.run_until_complete(main())
         loop.run_forever()
         ew.close()
+        ew.log(EventWriter.INFO,"Clean Exit")
 
 if __name__ == '__main__':
     exitcode = Input().run(sys.argv)
