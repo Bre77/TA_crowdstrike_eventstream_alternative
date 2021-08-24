@@ -94,7 +94,7 @@ class Input(Script):
                     login_data = await r.json()
                     r.raise_for_status()
                     auth['access_token'] = login_data.get('access_token')
-                ew.log(EventWriter.INFO,"Access Token refreshed")
+                ew.log(EventWriter.INFO,f"{name} - Access Token refreshed")
                 loop.create_task(login(self.REFRESH_INTERVAL)) #login_data['expires_in']-60
 
             await login()
@@ -111,8 +111,6 @@ class Input(Script):
                 loop.stop()
                 return
 
-            await asyncio.sleep(5)
-
             # Discover
             ew.log(EventWriter.INFO,f"Starting discover")
             async with session.get(discover_url, params={'appId':app_id}, headers={"Authorization": f"Bearer {auth['access_token']}", "Accept": "application/json", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
@@ -122,7 +120,7 @@ class Input(Script):
                     await session.close()
                     raise Exception("No Event Stream feeds discovered, cannot proceed")
                 count = len(discovery_data['resources'])
-                ew.log(EventWriter.INFO,f"Discovered {count} Event Stream feed(s)")
+                ew.log(EventWriter.INFO,f"{name} - Discovered {count} Event Stream feed(s)")
 
             # Listen
             async def listen(number,feed):
@@ -139,7 +137,7 @@ class Input(Script):
                         async with session.post(refresh_url,headers={'Authorization': f"Bearer {auth['access_token']}", 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                             r.raise_for_status()
                             await r.json()
-                            ew.log(EventWriter.INFO,f"Refreshed feed {number}")
+                            ew.log(EventWriter.INFO,f"{name} - Refreshed feed {number}")
                 
                 loop.create_task(refresh())
 
@@ -155,7 +153,7 @@ class Input(Script):
                 except:
                     offset = 0
                 
-                ew.log(EventWriter.INFO,f"Connecting to feed {number}")
+                ew.log(EventWriter.INFO,f"{name} - Connecting to feed {number}")
                 async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Accept': 'application/json', 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext, timeout=timeout) as r:
                     r.raise_for_status()
                     while True:
@@ -171,7 +169,7 @@ class Input(Script):
                         try:
                             data = json.loads(line)
                         except:
-                            ew.log(EventWriter.WARN,f"Failed to parse event: {line}")
+                            ew.log(EventWriter.WARN,f"{name} - Failed to parse event: {line}")
                             continue
 
                         offset = data['metadata']['offset']
@@ -194,9 +192,9 @@ class Input(Script):
                 if not feed['dataFeedURL'].startswith('https'):
                     await session.close()
                     raise Exception(f"Insecure feed URL: {feed['dataFeedURL']}")
-                loop.create_task(listen(number, feed))
                 await asyncio.sleep(5)
-
+                loop.create_task(listen(number, feed))
+                
         try:
             loop.run_until_complete(main())
             loop.run_forever()
