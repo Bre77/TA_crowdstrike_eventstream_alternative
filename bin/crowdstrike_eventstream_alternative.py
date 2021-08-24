@@ -146,7 +146,6 @@ class Input(Script):
                 # Listen for data
                 token = feed['sessionToken']['token']
                 data_url = feed['dataFeedURL']
-                source = f"Crowdstrike Event Stream {name} {number}"
                 checkpoint_file = os.path.join(
                     checkpoint_folder,
                     "".join([c for c in data_url if c.isalpha() or c.isdigit() or c==' ']).rstrip()
@@ -178,10 +177,16 @@ class Input(Script):
                         offset = data['metadata']['offset']
                         open(checkpoint_file, "w").write(str(offset))
 
+                        # Optional fix for the AuditKeyValues array
+                        if "AuditKeyValues" in data["event"]:
+                            data["event"]["Audit"] = {}
+                            for x in data["event"]["AuditKeyValues"]:
+                                data["event"]["Audit"][x.Key] = x.get('ValueString')
+
                         ew.write_event(Event(
                             time=data['metadata']['eventCreationTime']/1000,
                             data=json.dumps(data, separators=(',', ':')),
-                            source=source,
+                            source=data_url,
                             host=input_items['domain']
                         ))
 
