@@ -53,7 +53,7 @@ class Input(Script):
         kind, name = input_name.split("://")
         auth_url = f"https://{input_items['domain']}/oauth2/token"
         discover_url = f"https://{input_items['domain']}/sensors/entities/datafeed/v2"
-        app_id = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+        app_id = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).rstrip()+"1"
         checkpoint_folder = self._input_definition.metadata["checkpoint_dir"]
         auth = {"access_token":None,"client_id":None,"client_secret":None}
 
@@ -81,18 +81,21 @@ class Input(Script):
         
         
         # Setup Async
+        loop = asyncio.get_event_loop()
+        
         async def main():
             ew.log(EventWriter.INFO,f"Starting Event Stream '{app_id}'")
             session = aiohttp.ClientSession()
             # Login
             async def login(wait=0):
+                ew.log(EventWriter.INFO,f"Waiting {wait}s to refresh Access Token")
                 await asyncio.sleep(wait)
-                async with session.post(auth_url, data={'client_id':auth['client_id'],'client_secret':auth['client_secret']},headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+                async with session.post(auth_url, data=auth,headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                     login_data = await r.json()
                     r.raise_for_status()
                     auth['access_token'] = login_data.get('access_token')
-                ew.log(EventWriter.INFO,f"Access token refreshed")
-                loop.create_task(login(login_data['expires_in']-10))
+                ew.log(EventWriter.INFO,"Access Token refreshed")
+                loop.create_task(login(1740)) #login_data['expires_in']-60
 
             await login()
 
@@ -103,21 +106,19 @@ class Input(Script):
                 return
 
             if not discover_url.startswith('https'):
-                ew.log(EventWriter.ERROR,"Insecure discover URL: {discover_url}")
+                ew.log(EventWriter.ERROR,f"Insecure discover URL: {discover_url}")
                 await session.close()
                 loop.stop()
                 return
 
             # Discover
-            async with session.get(discover_url, params={'appId':app_id,'format':'json'}, headers={'Authorization': f"Bearer {auth['access_token']}", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+            ew.log(EventWriter.INFO,f"Starting discover")
+            async with session.get(discover_url, params={'appId':app_id}, headers={"Authorization": f"Bearer {auth['access_token']}", "Accept": "application/json", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                 r.raise_for_status()
                 discovery_data = await r.json()
-                ew.log(EventWriter.DEBUG,discovery_data)
                 if discovery_data['resources'] == None:
-                    ew.log(EventWriter.ERROR,"No Event Stream feeds discovered")
                     await session.close()
-                    loop.stop()
-                    return
+                    raise Exception("No Event Stream feeds discovered, cannot proceed")
                 count = len(discovery_data['resources'])
                 ew.log(EventWriter.INFO,f"Discovered {count} Event Stream feed(s)")
 
@@ -125,26 +126,26 @@ class Input(Script):
             async def listen(number,feed):
                 # Schedule Feed Refresh
                 refresh_url = feed['refreshActiveSessionURL']
-                refresh_time = feed['refreshActiveSessionInterval']
-                async def refresh():
-                    while True:
-                        await asyncio.sleep(refresh_time)
-                        async with session.post(refresh_url,headers={'Authorization': f"Bearer {auth['access_token']}", 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as refresh:
-                            r.raise_for_status()
-                            ew.log(EventWriter.INFO,"Refreshed feed {number}")
 
                 if not refresh_url.startswith('https'):
-                    ew.log(EventWriter.ERROR,"Insecure refresh URL: {refresh_url}")
                     await session.close()
-                    loop.stop()
-                    return
+                    raise Exception(f"Insecure refresh URL: {refresh_url}")
+
+                async def refresh():
+                    while True:
+                        ew.log(EventWriter.INFO,f"Refreshing feed {number} {refresh_url} in 1740s")
+                        await asyncio.sleep(1740)
+                        async with session.post(refresh_url,body={},headers={'Authorization': f"Bearer {auth['access_token']}", 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+                            r.raise_for_status()
+                            await r.json()
+                            ew.log(EventWriter.INFO,f"Refreshed feed {number}")
                 
                 loop.create_task(refresh())
 
                 # Listen for data
                 token = feed['sessionToken']['token']
                 data_url = feed['dataFeedURL']
-                source = f"Crowdstrike Eventstream {input_name} {number}"
+                source = f"Crowdstrike Event Stream {name} {number}"
                 checkpoint_file = os.path.join(
                     checkpoint_folder,
                     "".join([c for c in data_url if c.isalpha() or c.isdigit() or c==' ']).rstrip()
@@ -154,41 +155,45 @@ class Input(Script):
                 except:
                     offset = 0
                 
-                while True:
-                    async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
-                        r.raise_for_status()
-                        while True:
-                            raw = await r.content.readline()
-                            if raw == b'\r\n':
-                                continue #Just a keep alive
-                            try:
-                                data = json.loads(raw.decode('utf-8'))
-                            except:
-                                ew.log(EventWriter.WARN,"Failed to parse event: {raw}")
-                                continue
+                ew.log(EventWriter.INFO,f"Connecting to feed {number}")
+                async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Accept': 'application/json', 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+                    r.raise_for_status()
+                    while True:
+                        raw = await r.content.readline()
+                        if raw == b'\r\n':
+                            continue #Just a keep alive
+                        try:
+                            data = json.loads(raw.decode('utf-8'))
+                        except:
+                            ew.log(EventWriter.WARN,f"Failed to parse event: {raw}")
+                            continue
 
-                            offset = data['metadata']['offset']
-                            open(checkpoint_file, "w").write(str(offset))
+                        offset = data['metadata']['offset']
+                        open(checkpoint_file, "w").write(str(offset))
 
-                            ew.write_event(Event(
-                                time=data['metadata']['eventCreationTime']/1000,
-                                data=json.dumps(data, separators=(',', ':')),
-                                source=source,
-                                host=input_items['domain']
-                            ))
+                        ew.write_event(Event(
+                            time=data['metadata']['eventCreationTime']/1000,
+                            data=json.dumps(data, separators=(',', ':')),
+                            source=source,
+                            host=input_items['domain']
+                        ))
 
             for number, feed in enumerate(discovery_data['resources']):
                 if not feed['dataFeedURL'].startswith('https'):
-                    ew.log(EventWriter.ERROR,"Insecure feed URL: {feed['dataFeedURL']}")
                     await session.close()
-                    loop.stop()
-                asyncio.create_task(listen(number, feed))
+                    raise Exception(f"Insecure feed URL: {feed['dataFeedURL']}")
+                loop.create_task(listen(number, feed))
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
-        loop.run_forever()
+        try:
+            loop.run_until_complete(main())
+            loop.run_forever()
+        except Exception as e:
+            ew.log(EventWriter.ERROR,e)
+            loop.stop()
+
         ew.close()
         ew.log(EventWriter.INFO,"Clean Exit")
+        exit(0)
 
 if __name__ == '__main__':
     exitcode = Input().run(sys.argv)
