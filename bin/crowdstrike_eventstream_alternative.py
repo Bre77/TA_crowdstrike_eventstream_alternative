@@ -7,13 +7,12 @@ import ssl
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from splunklib.modularinput import *
 import aiohttp
-import certifi
 
 class Input(Script):
     MASK = "<encrypted>"
     APP = __file__.split(os.sep)[-3]
     USER_AGENT = "Splunk TA_crowdstrike_eventstream_alternative"
-    ACCESS_TOKEN = None
+    REFRESH_INTERVAL = 1740
 
     def get_scheme(self):
 
@@ -53,9 +52,10 @@ class Input(Script):
         kind, name = input_name.split("://")
         auth_url = f"https://{input_items['domain']}/oauth2/token"
         discover_url = f"https://{input_items['domain']}/sensors/entities/datafeed/v2"
-        app_id = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).rstrip()+"1"
+        app_id = ("".join([c for c in name if c.isalpha() or c.isdigit()]).rstrip())[:15]
         checkpoint_folder = self._input_definition.metadata["checkpoint_dir"]
         auth = {"access_token":None,"client_id":None,"client_secret":None}
+        timeout = aiohttp.ClientTimeout(connect=10,total=0)
 
         sslcontext = ssl.create_default_context(cafile=os.path.join(os.path.dirname(__file__),'cacert.pem'))
 
@@ -88,14 +88,14 @@ class Input(Script):
             session = aiohttp.ClientSession()
             # Login
             async def login(wait=0):
-                ew.log(EventWriter.INFO,f"Waiting {wait}s to refresh Access Token")
+                #ew.log(EventWriter.INFO,f"Waiting {wait}s to refresh Access Token")
                 await asyncio.sleep(wait)
                 async with session.post(auth_url, data=auth,headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                     login_data = await r.json()
                     r.raise_for_status()
                     auth['access_token'] = login_data.get('access_token')
                 ew.log(EventWriter.INFO,"Access Token refreshed")
-                loop.create_task(login(1740)) #login_data['expires_in']-60
+                loop.create_task(login(self.REFRESH_INTERVAL)) #login_data['expires_in']-60
 
             await login()
 
@@ -133,8 +133,7 @@ class Input(Script):
 
                 async def refresh():
                     while True:
-                        ew.log(EventWriter.INFO,f"Refreshing feed {number} {refresh_url} in 1740s")
-                        await asyncio.sleep(1740)
+                        await asyncio.sleep(self.REFRESH_INTERVAL)
                         async with session.post(refresh_url,body={},headers={'Authorization': f"Bearer {auth['access_token']}", 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                             r.raise_for_status()
                             await r.json()
@@ -156,10 +155,16 @@ class Input(Script):
                     offset = 0
                 
                 ew.log(EventWriter.INFO,f"Connecting to feed {number}")
-                async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Accept': 'application/json', 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+                async with session.get(f"{data_url}&offset={offset}",headers={'Authorization': f"Token {token}", 'Accept': 'application/json', 'Connection': 'Keep-Alive', 'X-INTEGRATION': app_id, 'User-Agent': self.USER_AGENT}, ssl=sslcontext, timeout=timeout) as r:
                     r.raise_for_status()
                     while True:
-                        raw = await r.content.readline()
+                        try:
+                            raw = await r.content.readline()
+                        except Exception as e:
+                            ew.log(EventWriter.ERROR,e)
+                            loop.stop()
+                            await session.close()
+                            return
                         if raw == b'\r\n':
                             continue #Just a keep alive
                         try:
