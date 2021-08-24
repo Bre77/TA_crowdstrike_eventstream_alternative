@@ -111,6 +111,8 @@ class Input(Script):
                 loop.stop()
                 return
 
+            await asyncio.sleep(5)
+
             # Discover
             ew.log(EventWriter.INFO,f"Starting discover")
             async with session.get(discover_url, params={'appId':app_id}, headers={"Authorization": f"Bearer {auth['access_token']}", "Accept": "application/json", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
@@ -134,7 +136,7 @@ class Input(Script):
                 async def refresh():
                     while True:
                         await asyncio.sleep(self.REFRESH_INTERVAL)
-                        async with session.post(refresh_url,body={},headers={'Authorization': f"Bearer {auth['access_token']}", 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
+                        async with session.post(refresh_url,headers={'Authorization': f"Bearer {auth['access_token']}", 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                             r.raise_for_status()
                             await r.json()
                             ew.log(EventWriter.INFO,f"Refreshed feed {number}")
@@ -159,18 +161,18 @@ class Input(Script):
                     r.raise_for_status()
                     while True:
                         try:
-                            raw = await r.content.readline()
+                            line = (await r.content.readline()).decode('utf-8')
                         except Exception as e:
                             ew.log(EventWriter.ERROR,e)
                             loop.stop()
                             await session.close()
                             return
-                        if raw == b'\r\n':
+                        if line == '\r\n':
                             continue #Just a keep alive
                         try:
-                            data = json.loads(raw.decode('utf-8'))
+                            data = json.loads(line)
                         except:
-                            ew.log(EventWriter.WARN,f"Failed to parse event: {raw}")
+                            ew.log(EventWriter.WARN,f"Failed to parse event: {line}")
                             continue
 
                         offset = data['metadata']['offset']
@@ -188,6 +190,7 @@ class Input(Script):
                     await session.close()
                     raise Exception(f"Insecure feed URL: {feed['dataFeedURL']}")
                 loop.create_task(listen(number, feed))
+                await asyncio.sleep(5)
 
         try:
             loop.run_until_complete(main())
