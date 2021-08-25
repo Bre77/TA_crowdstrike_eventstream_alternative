@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import json
 import asyncio
@@ -16,7 +17,7 @@ class Input(Script):
 
     def get_scheme(self):
 
-        scheme = Scheme("CrowdStrike Event Stream (alternative)")
+        scheme = Scheme("CrowdStrike Event Stream (unoffical)")
         scheme.description = ("A single threaded asynchronous implementation of the CrowdStrike Falcon Event Stream")
         scheme.use_external_validation = False
         scheme.streaming_mode_xml = True
@@ -54,10 +55,10 @@ class Input(Script):
         discover_url = f"https://{input_items['domain']}/sensors/entities/datafeed/v2"
         app_id = ("".join([c for c in name if c.isalpha() or c.isdigit()]).rstrip())[:15]
         checkpoint_folder = self._input_definition.metadata["checkpoint_dir"]
-        auth = {"access_token":None,"client_id":None,"client_secret":None}
-        timeout = aiohttp.ClientTimeout(connect=10,total=0)
 
-        sslcontext = ssl.create_default_context(cafile=os.path.join(os.path.dirname(__file__),'cacert.pem'))
+        auth = {"access_token":None,"client_id":None,"client_secret":None}
+        timeout = aiohttp.ClientTimeout(connect=10,sock_read=11,total=0) #Keep alives are sent every 5 seconds
+        sslcontext = ssl.create_default_context(cafile=os.path.join(os.path.dirname(__file__),'cacert.pem')) #Crowdstrike Cert fails in default certifi
 
         # Password Encryption / Decryption
         updates = {}
@@ -86,6 +87,17 @@ class Input(Script):
         async def main():
             ew.log(EventWriter.INFO,f"Starting Event Stream '{app_id}'")
             session = aiohttp.ClientSession()
+
+            # Handle Signals/Errors gracefully
+            async def exit(reason, level=EventWriter.INFO):
+                ew.log(level,f"{name} - {reason}")
+                await session.close()
+                loop.stop()
+
+            # Listen for signals
+            for signame in ('SIGINT', 'SIGTERM', 'SIGABRT'):
+                loop.add_signal_handler(getattr(signal, signame),lambda: loop.create_task(exit(signame)))
+
             # Login
             async def login(wait=0):
                 #ew.log(EventWriter.INFO,f"Waiting {wait}s to refresh Access Token")
@@ -100,16 +112,10 @@ class Input(Script):
             await login()
 
             if auth['access_token'] == None:
-                ew.log(EventWriter.ERROR,"No Access token, cannot proceed")
-                await session.close()
-                loop.stop()
-                return
+                return await exit("No Access token, cannot proceed",EventWriter.ERROR)
 
             if not discover_url.startswith('https'):
-                ew.log(EventWriter.ERROR,f"Insecure discover URL: {discover_url}")
-                await session.close()
-                loop.stop()
-                return
+                return await exit(f"Insecure discover URL: {discover_url}",EventWriter.ERROR)
 
             # Discover
             ew.log(EventWriter.INFO,f"Starting discover")
@@ -117,8 +123,9 @@ class Input(Script):
                 r.raise_for_status()
                 discovery_data = await r.json()
                 if discovery_data['resources'] == None:
-                    await session.close()
-                    raise Exception("No Event Stream feeds discovered, cannot proceed")
+                    #ew.log(EventWriter.INFO,f"{name} - Disable me now")
+                    #await asyncio.sleep(600)
+                    return await exit("No Event Stream feeds discovered, cannot proceed",EventWriter.ERROR)
                 count = len(discovery_data['resources'])
                 ew.log(EventWriter.INFO,f"{name} - Discovered {count} Event Stream feed(s)")
 
@@ -159,11 +166,13 @@ class Input(Script):
                     while True:
                         try:
                             line = (await r.content.readline()).decode('utf-8')
+                        #except aiohttp.ClientError as e:
+                        #    await session.close()
+                        #    raise Exception(e)
                         except Exception as e:
-                            ew.log(EventWriter.ERROR,e)
-                            loop.stop()
-                            await session.close()
-                            return
+                            return await exit(e,EventWriter.ERROR)
+                        if line == '':
+                            return await exit("Connection Closed (EOF)",EventWriter.WARN)
                         if line == '\r\n':
                             continue #Just a keep alive
                         try:
@@ -172,15 +181,21 @@ class Input(Script):
                             ew.log(EventWriter.WARN,f"{name} - Failed to parse event: {line}")
                             continue
 
+                        # Save checkpoint (this isnt ideal for performance, but safe)
                         offset = data['metadata']['offset']
                         open(checkpoint_file, "w").write(str(offset))
 
                         # Optional fix for the AuditKeyValues array
-                        if "AuditKeyValues" in data["event"]:
-                            data["event"]["Audit"] = {}
-                            for x in data["event"]["AuditKeyValues"]:
-                                data["event"]["Audit"][x.Key] = x.get('ValueString')
+                        try:
+                            if "AuditKeyValues" in data["event"]:
+                                data["event"]["Audit"] = {}
+                                for x in data["event"]["AuditKeyValues"]:
+                                    if "Key" in x:
+                                        data["event"]["Audit"][x['Key']] = x.get('ValueString')
+                        except AttributeError:
+                            pass
 
+                        # Write the event
                         ew.write_event(Event(
                             time=data['metadata']['eventCreationTime']/1000,
                             data=json.dumps(data, separators=(',', ':')),
@@ -193,10 +208,14 @@ class Input(Script):
                     await session.close()
                     raise Exception(f"Insecure feed URL: {feed['dataFeedURL']}")
                 await asyncio.sleep(5)
-                loop.create_task(listen(number, feed))
+                try:
+                    loop.create_task(listen(number, feed))
+                except Exception as e:
+                    await session.close()
+                    raise Exception(e)
                 
         try:
-            loop.run_until_complete(main())
+            loop.create_task(main())
             loop.run_forever()
         except Exception as e:
             ew.log(EventWriter.ERROR,e)
