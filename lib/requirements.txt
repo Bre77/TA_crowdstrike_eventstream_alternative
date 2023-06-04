@@ -1,0 +1,7 @@
+aiohttp
+async_timeout
+attr
+multidict
+splunk-sdk
+yarl
+typing_extensions

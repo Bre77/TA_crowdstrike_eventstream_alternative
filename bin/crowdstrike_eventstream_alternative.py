@@ -83,24 +83,24 @@ class Input(Script):
         
         # Setup Async
         loop = asyncio.get_event_loop()
-        
+
         async def main():
-            ew.log(EventWriter.INFO,f"Starting Event Stream '{app_id}'")
+            ew.log(EventWriter.INFO,f"{name} - Starting Event Stream '{app_id}'")
             session = aiohttp.ClientSession()
 
             # Handle Signals/Errors gracefully
             async def exit(reason, level=EventWriter.INFO):
                 ew.log(level,f"{name} - {reason}")
                 await session.close()
+                ew.log(EventWriter.INFO,f"{name} - aiohttp session closed")
                 loop.stop()
 
             # Listen for signals
-            for signame in ('SIGINT', 'SIGTERM', 'SIGABRT'):
+            for signame in ('SIGINT', 'SIGTERM'):
                 loop.add_signal_handler(getattr(signal, signame),lambda: loop.create_task(exit(signame)))
 
             # Login
             async def login(wait=0):
-                #ew.log(EventWriter.INFO,f"Waiting {wait}s to refresh Access Token")
                 await asyncio.sleep(wait)
                 async with session.post(auth_url, data=auth,headers={'content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                     login_data = await r.json()
@@ -118,13 +118,11 @@ class Input(Script):
                 return await exit(f"Insecure discover URL: {discover_url}",EventWriter.ERROR)
 
             # Discover
-            ew.log(EventWriter.INFO,f"Starting discover")
+            ew.log(EventWriter.INFO,f"{name} - Starting discover")
             async with session.get(discover_url, params={'appId':app_id}, headers={"Authorization": f"Bearer {auth['access_token']}", "Accept": "application/json", 'User-Agent': self.USER_AGENT}, ssl=sslcontext) as r:
                 r.raise_for_status()
                 discovery_data = await r.json()
                 if discovery_data['resources'] == None:
-                    #ew.log(EventWriter.INFO,f"{name} - Disable me now")
-                    #await asyncio.sleep(600)
                     return await exit("No Event Stream feeds discovered, cannot proceed",EventWriter.ERROR)
                 count = len(discovery_data['resources'])
                 ew.log(EventWriter.INFO,f"{name} - Discovered {count} Event Stream feed(s)")
@@ -135,8 +133,7 @@ class Input(Script):
                 refresh_url = feed['refreshActiveSessionURL']
 
                 if not refresh_url.startswith('https'):
-                    await session.close()
-                    raise Exception(f"Insecure refresh URL: {refresh_url}")
+                    return await exit(f"Insecure refresh URL: {refresh_url}",EventWriter.ERROR)
 
                 async def refresh():
                     while True:
@@ -205,14 +202,12 @@ class Input(Script):
 
             for number, feed in enumerate(discovery_data['resources']):
                 if not feed['dataFeedURL'].startswith('https'):
-                    await session.close()
-                    raise Exception(f"Insecure feed URL: {feed['dataFeedURL']}")
+                    return await exit(f"Insecure feed URL: {feed['dataFeedURL']}",EventWriter.ERROR)
                 await asyncio.sleep(5)
                 try:
                     loop.create_task(listen(number, feed))
                 except Exception as e:
-                    await session.close()
-                    raise Exception(e)
+                    return await exit(e,EventWriter.ERROR)
                 
         try:
             loop.create_task(main())
@@ -220,10 +215,12 @@ class Input(Script):
         except Exception as e:
             ew.log(EventWriter.ERROR,e)
             loop.stop()
+        finally:
+            loop.close()
 
         ew.close()
         ew.log(EventWriter.INFO,"Clean Exit")
-        exit(0)
+        return
 
 if __name__ == '__main__':
     exitcode = Input().run(sys.argv)
